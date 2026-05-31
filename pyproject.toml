@@ -1,0 +1,12 @@
+[project]
+name = "mihomo-cli"
+version = "0.1.0"
+description = "Standalone CLI controller for mihomo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyyaml"]
+
+[project.scripts]
+mihomo-ctl = "mihomo_ctl:main"
+
+[tool.uv]
