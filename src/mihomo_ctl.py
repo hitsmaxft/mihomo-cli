@@ -3,13 +3,7 @@
 # dependencies = ["pyyaml"]
 # ///
 """mihomo-ctl: standalone CLI controller for mihomo.
-
-Config directory: ~/.local/share/mihomo/
-  config.yaml     - base config (ports, dns, tun)
-  profiles.yaml   - subscription list
-  profiles/       - downloaded subscription files
-  script.js       - global enhancement script
-  generated.yaml  - final generated config for mihomo
+Optimized for agent use: rich output, smart defaults, reduced calls.
 """
 
 import gzip
@@ -36,7 +30,7 @@ if USE_VERGE:
     sys.argv.remove("--verge")
 
 VERGE_DIR = os.path.expanduser(
-    "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+    "~/.config/mihomo-ctl/verge"
 )
 OWN_DIR = os.path.expanduser("~/.local/share/mihomo")
 
@@ -58,6 +52,20 @@ else:
 # Socket: prefer Verge's (if --verge or exists), then own
 SOCK_VERGE = "/tmp/verge/verge-mihomo.sock"
 SOCK_OWN = "/tmp/mihomo-ctl.sock"
+
+# ─── Options ───────────────────────────────────────────────────────────────────
+
+JSON_OUTPUT = "--json" in sys.argv
+HINTS = "--hints" in sys.argv or "--help" in sys.argv
+if JSON_OUTPUT:
+    sys.argv.remove("--json")
+if "--hints" in sys.argv:
+    sys.argv.remove("--hints")
+if "--no-hints" in sys.argv:
+    sys.argv.remove("--no-hints")
+    HINTS = False
+
+# ─── Unix socket HTTP client ──────────────────────────────────────────────────
 
 
 def _find_sock():
@@ -85,11 +93,12 @@ def get_sock():
     sock = _find_sock()
     if sock:
         return sock
-    print("Error: no mihomo socket found. Is mihomo running?")
+    result = {"error": "no mihomo socket found", "hint": "Is mihomo running?"}
+    if JSON_OUTPUT:
+        print(json.dumps(result))
+    else:
+        print("Error: no mihomo socket found. Is mihomo running?")
     sys.exit(1)
-
-
-# ─── Unix socket HTTP client ──────────────────────────────────────────────────
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -136,78 +145,377 @@ def reload_config():
     api("/configs?force=true", "PUT", {"path": GENERATED_YAML, "payload": ""})
 
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
+def _out(data, **extra):
+    """Output handler: JSON or pretty print."""
+    if JSON_OUTPUT:
+        if isinstance(data, str):
+            print(json.dumps({"output": data, **extra}))
+        else:
+            print(json.dumps({**data, **extra}))
+    else:
+        if isinstance(data, dict):
+            for k, v in data.items():
+                print(f"  {k}: {v}")
+        else:
+            print(data)
 
+
+# ─── Combined commands for agent efficiency ────────────────────────────────────
+
+def cmd_overview():
+    """Get everything an agent needs in one call.
+    
+    Returns: groups with current node, total proxies, quick status.
+    """
+    ver = api("/version")
+    cfg = api("/configs")
+    groups_data = api("/group")
+    
+    result = {
+        "version": ver.get("version", "?"),
+        "mode": cfg.get("mode", "?"),
+        "mixed_port": cfg.get("mixed-port", "?"),
+        "tun": cfg.get("tun", {}).get("enable", False),
+        "socket": get_sock(),
+        "groups": [],
+    }
+    
+    for g in groups_data.get("proxies", []):
+        group_info = {
+            "name": g["name"],
+            "type": g["type"],
+            "current": g.get("now", "N/A"),
+            "proxies": g.get("all", []),
+            "count": len(g.get("all", [])),
+        }
+        result["groups"].append(group_info)
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Mihomo v{result['version']} ({result['mode']} mode) ===")
+        print(f"Socket: {result['socket']}")
+        print(f"Port: {result['mixed_port']} | TUN: {result['tun']}")
+        print()
+        print("Groups:")
+        for g in result["groups"]:
+            marker = ""
+            if "Auto" in g["name"] or "Fast" in g["name"]:
+                marker = " ⭐"
+            print(f"  {g['name']:20s} ({g['count']:2d} nodes) => {g['current']}{marker}")
+        
+        if HINTS:
+            print()
+            print("Hints:")
+            print("  mihomo-ctl gdelay <group>   # Test group latency")
+            print("  mihomo-ctl switch <grp> <node>  # Switch node")
+            print("  mihomo-ctl sub            # Update subscriptions")
+
+
+def cmd_gdelay_with_switch(group_name=None, auto=False):
+    """Test group latency and suggest/apply best node.
+    
+    Args:
+        group_name: Group to test (auto-detect if None)
+        auto: If True, auto-switch to fastest node
+    """
+    groups_data = api("/group")
+    groups = groups_data.get("proxies", [])
+    
+    # Auto-detect best group to test
+    if not group_name:
+        # Prefer groups with "Fast" or "Auto" in name
+        for g in groups:
+            if "Fast" in g["name"] or "Auto" in g["name"]:
+                group_name = g["name"]
+                break
+        if not group_name:
+            group_name = groups[0]["name"] if groups else None
+    
+    if not group_name:
+        result = {"error": "No groups found"}
+        if JSON_OUTPUT:
+            print(json.dumps(result))
+        else:
+            print("Error: No groups found")
+        return
+    
+    result = api(f"/group/{urlencode(group_name)}/delay?url=https://www.gstatic.com/generate_204&timeout=5000")
+    
+    if not isinstance(result, dict):
+        _out({"error": str(result)})
+        return
+    
+    # Parse results
+    alive = [(n, d) for n, d in result.items() if isinstance(d, int) and d > 0]
+    dead = [(n, d) for n, d in result.items() if not (isinstance(d, int) and d > 0)]
+    alive.sort(key=lambda x: x[1])
+    
+    output = {
+        "group": group_name,
+        "tested": len(alive) + len(dead),
+        "alive": len(alive),
+        "timeout": len(dead),
+        "results": [{"node": n, "delay": d} for n, d in alive] + [{"node": n, "delay": -1} for n, _ in dead],
+        "fastest": {"node": alive[0][0], "delay": alive[0][1]} if alive else None,
+    }
+    
+    if JSON_OUTPUT:
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"=== Latency Test: {group_name} ===")
+        print(f"Tested: {output['tested']} | Alive: {output['alive']} | Timeout: {output['timeout']}")
+        print()
+        if alive:
+            print("By delay (ascending):")
+            for name, delay in alive[:10]:
+                marker = " ◀ CURRENT" if name == _get_current_for_group(group_name, groups) else ""
+                print(f"  {delay:5d}ms  {name}{marker}")
+        
+        if dead:
+            print("\nTimeout:")
+            for name, _ in dead[:5]:
+                print(f"  timeout  {name}")
+        
+        if output["fastest"]:
+            print(f"\nFastest: {output['fastest']['node']} ({output['fastest']['delay']}ms)")
+        
+        if HINTS:
+            print()
+            print("Hints:")
+            print(f"  mihomo-ctl switch {group_name} {output['fastest']['node']}  # Switch to fastest")
+            if not auto and len(alive) > 1:
+                print(f"  mihomo-ctl gdelay {group_name} --auto  # Auto-switch to fastest")
+            
+            # Suggest other actions
+            print()
+            print("Other groups:")
+            for g in groups:
+                if g["name"] != group_name and ("Fast" in g["name"] or "Auto" in g["name"]):
+                    print(f"  mihomo-ctl gdelay {g['name']}")
+
+
+def _get_current_for_group(group_name, groups):
+    for g in groups:
+        if g["name"] == group_name:
+            return g.get("now", "")
+    return ""
+
+
+def cmd_switch_with_verification(group, proxy):
+    """Switch node with verification and next-step hints."""
+    groups_data = api("/group")
+    groups = groups_data.get("proxies", [])
+    
+    # Get current before switch
+    before = _get_current_for_group(group, groups)
+    
+    # Do switch
+    result = api(f"/proxies/{urlencode(group)}", "PUT", {"name": proxy})
+    
+    # Verify
+    after_groups = api("/group").get("proxies", [])
+    after = _get_current_for_group(group, after_groups)
+    
+    success = after == proxy
+    
+    output = {
+        "group": group,
+        "target": proxy,
+        "before": before,
+        "after": after,
+        "success": success,
+    }
+    
+    if JSON_OUTPUT:
+        print(json.dumps(output, indent=2))
+    else:
+        if success:
+            print(f"✓ Switched [{group}]: {before} → {proxy}")
+        else:
+            print(f"✗ Failed to switch. Current: {after}")
+        
+        if HINTS:
+            print()
+            print("Hints:")
+            print("  mihomo-ctl delay " + proxy + "  # Verify node works")
+            print("  mihomo-ctl conns           # Check connections")
+            print("  mihomo-ctl gdelay " + group + "  # Re-test group latency")
+
+
+def cmd_sub_with_summary():
+    """Update subscriptions and show summary."""
+    print("=== Updating subscriptions ===")
+    _fetch_subscriptions()
+    print()
+    cmd_apply()
+    print()
+    
+    # Show new group state
+    groups_data = api("/group")
+    groups = groups_data.get("proxies", [])
+    
+    if JSON_OUTPUT:
+        print(json.dumps({"groups": [{"name": g["name"], "current": g.get("now", ""), "count": len(g.get("all", []))} for g in groups]}))
+    else:
+        print("=== Updated Groups ===")
+        for g in groups:
+            marker = " ⭐" if "Fast" in g["name"] or "Auto" in g["name"] else ""
+            print(f"  {g['name']:20s} ({len(g.get('all', []))} nodes) => {g.get('now', 'N/A')}{marker}")
+        
+        if HINTS:
+            print()
+            print("Hints:")
+            print("  mihomo-ctl gdelay Fast    # Test the Fast group")
+            print("  mihomo-ctl overview      # See all groups")
+
+
+def cmd_status_with_groups():
+    """Status + proxy groups overview."""
+    ver = api("/version")
+    cfg = api("/configs")
+    groups_data = api("/group")
+    groups = groups_data.get("proxies", [])
+    
+    # Traffic summary
+    traffic = api("/traffic")
+    
+    result = {
+        "version": ver.get("version", "?"),
+        "mode": cfg.get("mode", "?"),
+        "config": {
+            "mixed_port": cfg.get("mixed-port"),
+            "allow_lan": cfg.get("allow-lan"),
+            "log_level": cfg.get("log-level"),
+            "tun": cfg.get("tun", {}).get("enable"),
+            "ipv6": cfg.get("ipv6"),
+        },
+        "socket": get_sock(),
+        "traffic": {
+            "up_speed": traffic.get("up", 0),
+            "down_speed": traffic.get("down", 0),
+            "up_total": traffic.get("upTotal", 0),
+            "down_total": traffic.get("downTotal", 0),
+        },
+        "groups": [{"name": g["name"], "type": g["type"], "current": g.get("now", ""), "count": len(g.get("all", []))} for g in groups],
+    }
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Mihomo v{result['version']} ===")
+        print(f"Mode: {result['mode']} | Port: {result['config']['mixed_port']} | TUN: {result['config']['tun']}")
+        
+        t = result["traffic"]
+        up = t["up_speed"] / 1024
+        down = t["down_speed"] / 1024
+        up_mb = t["up_total"] / 1024 / 1024
+        down_mb = t["down_total"] / 1024 / 1024
+        print(f"Traffic: ↑{up:.1f}KB/s ↓{down:.1f}KB/s | Total: ↑{up_mb:.1f}MB ↓{down_mb:.1f}MB")
+        print()
+        print("Groups:")
+        for g in result["groups"]:
+            marker = " ⭐" if "Fast" in g["name"] or "Auto" in g["name"] else ""
+            print(f"  {g['name']:20s} ({g['count']:2d}) => {g['current']}{marker}")
+        
+        if HINTS:
+            print()
+            print("Hints:")
+            print("  mihomo-ctl gdelay Fast       # Test Fast group latency")
+            print("  mihomo-ctl switch <grp> <px> # Switch node")
+            print("  mihomo-ctl sub              # Update subscriptions")
+
+
+# ─── Original commands (simplified) ────────────────────────────────────────────
 
 def cmd_status():
     ver = api("/version")
     cfg = api("/configs")
-    print("=== Mihomo Status ===")
-    print(f"  Version:    {ver.get('version', '?')}")
-    print(f"  Mode:       {cfg['mode']}")
-    print(f"  Mixed Port: {cfg['mixed-port']}")
-    print(f"  Allow LAN:  {cfg['allow-lan']}")
-    print(f"  Log Level:  {cfg['log-level']}")
-    print(f"  TUN:        {cfg['tun']['enable']}")
-    print(f"  IPv6:       {cfg['ipv6']}")
-    print(f"  Socket:     {get_sock()}")
-
-
-def cmd_mode(new_mode=None):
-    if new_mode:
-        api("/configs", "PATCH", {"mode": new_mode})
-        print(f"Mode switched to: {new_mode}")
-    else:
-        cfg = api("/configs")
-        print(cfg["mode"])
+    _out({
+        "version": ver.get("version", "?"),
+        "mode": cfg.get("mode", "?"),
+        "mixed_port": cfg.get("mixed-port"),
+        "allow_lan": cfg.get("allow-lan"),
+        "log_level": cfg.get("log-level"),
+        "tun": cfg.get("tun", {}).get("enable"),
+        "ipv6": cfg.get("ipv6"),
+        "socket": get_sock(),
+    })
 
 
 def cmd_groups():
     data = api("/group")
-    for g in data.get("proxies", []):
-        t = g["type"]
-        name = g["name"]
-        now = g.get("now", "N/A")
-        print(f"  [{t:10s}] {name:20s} => {now}")
+    groups = data.get("proxies", [])
+    
+    result = [{"name": g["name"], "type": g["type"], "current": g.get("now", ""), "count": len(g.get("all", []))} for g in groups]
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        print("Groups:")
+        for g in groups:
+            t = g["type"]
+            name = g["name"]
+            now = g.get("now", "N/A")
+            count = len(g.get("all", []))
+            marker = " ⭐" if "Fast" in name or "Auto" in name else ""
+            print(f"  [{t:10s}] {name:20s} ({count:2d}) => {now}{marker}")
 
 
 def cmd_list(group):
     data = api(f"/proxies/{urlencode(group)}")
     if isinstance(data, str) or "message" in (data or {}):
-        print(f"Error: group '{group}' not found")
+        _out({"error": f"Group '{group}' not found"})
         sys.exit(1)
     now = data.get("now", "")
-    for i, n in enumerate(data.get("all", [])):
-        marker = " ◀" if n == now else ""
-        print(f"  {i+1:2d}. {n}{marker}")
+    all_proxies = data.get("all", [])
+    
+    result = {"group": group, "current": now, "proxies": [{"name": n, "selected": n == now} for n in all_proxies]}
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== {group} ===")
+        for i, n in enumerate(all_proxies):
+            marker = " ◀" if n == now else ""
+            print(f"  {i+1:2d}. {n}{marker}")
 
 
 def cmd_switch(group, proxy):
     api(f"/proxies/{urlencode(group)}", "PUT", {"name": proxy})
-    print(f"Switched [{group}] => {proxy}")
+    _out({"message": f"Switched [{group}] => {proxy}"})
 
 
 def cmd_delay(proxy, url="https://www.gstatic.com/generate_204", timeout="5000"):
-    result = api(
-        f"/proxies/{urlencode(proxy)}/delay?url={url}&timeout={timeout}"
-    )
+    result = api(f"/proxies/{urlencode(proxy)}/delay?url={url}&timeout={timeout}")
     if isinstance(result, dict) and "delay" in result:
-        print(f"  {proxy}: {result['delay']}ms")
+        _out({"proxy": proxy, "delay": result["delay"], "unit": "ms"})
     else:
-        print(json.dumps(result, indent=2))
+        _out(result)
 
 
 def cmd_gdelay(group, url="https://www.gstatic.com/generate_204", timeout="5000"):
     result = api(f"/group/{urlencode(group)}/delay?url={url}&timeout={timeout}")
     if not isinstance(result, dict):
-        print(f"Error: {result}")
+        _out({"error": str(result)})
         return
+    
     alive = [(n, d) for n, d in result.items() if isinstance(d, int) and d > 0]
     alive.sort(key=lambda x: x[1])
-    for name, delay in alive:
-        print(f"  {delay:5d}ms  {name}")
     dead = [(n, d) for n, d in result.items() if not (isinstance(d, int) and d > 0)]
-    if dead:
+    
+    output = {
+        "group": group,
+        "results": [{"node": n, "delay": d} for n, d in alive] + [{"node": n, "timeout": True} for n, _ in dead],
+        "fastest": {"node": alive[0][0], "delay": alive[0][1]} if alive else None,
+    }
+    
+    if JSON_OUTPUT:
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"=== {group} latency ===")
+        for name, delay in alive:
+            print(f"  {delay:5d}ms  {name}")
         for n, _ in dead:
             print(f"  timeout  {n}")
 
@@ -215,42 +523,65 @@ def cmd_gdelay(group, url="https://www.gstatic.com/generate_204", timeout="5000"
 def cmd_conns():
     data = api("/connections")
     conns = data.get("connections", [])
-    print(f"Active connections: {len(conns)}")
-    print("─" * 70)
-    for c in sorted(conns, key=lambda x: x.get("start", ""), reverse=True)[:30]:
-        meta = c.get("metadata", {})
-        host = meta.get("host", "") or meta.get("destinationIP", "")
-        port = meta.get("destinationPort", "")
-        network = meta.get("network", "")
-        typ = meta.get("type", "")
-        chains = " -> ".join(c.get("chains", []))
-        dl = c.get("download", 0) / 1024
-        ul = c.get("upload", 0) / 1024
-        print(f"  {typ:5s} {network:3s} {host}:{port}")
-        print(f"        chain: {chains}  ↓{dl:.1f}KB ↑{ul:.1f}KB")
+    
+    result = {
+        "count": len(conns),
+        "connections": [{
+            "host": c.get("metadata", {}).get("host", ""),
+            "port": c.get("metadata", {}).get("destinationPort", ""),
+            "network": c.get("metadata", {}).get("network", ""),
+            "chain": c.get("chains", []),
+            "download": c.get("download", 0),
+            "upload": c.get("upload", 0),
+        } for c in conns[:30]]
+    }
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Active connections: {len(conns)}")
+        print("-" * 70)
+        for c in sorted(conns, key=lambda x: x.get("start", ""), reverse=True)[:30]:
+            meta = c.get("metadata", {})
+            host = meta.get("host", "") or meta.get("destinationIP", "")
+            port = meta.get("destinationPort", "")
+            network = meta.get("network", "")
+            typ = meta.get("type", "")
+            chains = " -> ".join(c.get("chains", []))
+            dl = c.get("download", 0) / 1024
+            ul = c.get("upload", 0) / 1024
+            print(f"  {typ:5s} {network:3s} {host}:{port}")
+            print(f"        chain: {chains}  ↓{dl:.1f}KB ↑{ul:.1f}KB")
 
 
 def cmd_killall():
     api("/connections", "DELETE")
-    print("All connections closed.")
+    _out({"message": "All connections closed"})
 
 
 def cmd_dns(domain, qtype="A"):
     data = api(f"/dns/query?name={domain}&type={qtype}")
-    for a in data.get("Answer", []):
-        print(f"  {a['name']:30s} TTL={a['TTL']:5d}  {a['data']}")
-    if not data.get("Answer"):
-        print("  (no answer)")
+    answers = data.get("Answer", [])
+    
+    result = {"domain": domain, "type": qtype, "answers": [{"name": a["name"], "ttl": a["TTL"], "data": a["data"]} for a in answers]}
+    
+    if JSON_OUTPUT:
+        print(json.dumps(result, indent=2))
+    else:
+        for a in answers:
+            print(f"  {a['name']:30s} TTL={a['TTL']:5d}  {a['data']}")
+        if not answers:
+            print("  (no answer)")
 
 
 def cmd_flush_dns():
     api("/cache/dns/flush", "POST")
-    print("DNS cache flushed.")
+    _out({"message": "DNS cache flushed"})
 
 
 def cmd_flush_fakeip():
     api("/cache/fakeip/flush", "POST")
-    print("FakeIP cache flushed.")
+    _out({"message": "FakeIP cache flushed"})
 
 
 def cmd_reload(path=None):
@@ -258,12 +589,12 @@ def cmd_reload(path=None):
         api("/configs?force=true", "PUT", {"path": path, "payload": ""})
     else:
         reload_config()
-    print("Config reloaded.")
+    _out({"message": "Config reloaded"})
 
 
 def cmd_patch(json_str):
     api("/configs", "PATCH", json.loads(json_str))
-    print("Config patched.")
+    _out({"message": "Config patched"})
 
 
 def cmd_traffic():
@@ -279,10 +610,7 @@ def cmd_traffic():
             down = t["down"] / 1024
             up_t = t["upTotal"] / 1024 / 1024
             down_t = t["downTotal"] / 1024 / 1024
-            print(
-                f"  ↑ {up:8.1f} KB/s  ↓ {down:8.1f} KB/s  |  Total ↑ {up_t:.1f} MB  ↓ {down_t:.1f} MB",
-                flush=True,
-            )
+            print(f"  ↑ {up:8.1f} KB/s  ↓ {down:8.1f} KB/s  |  Total ↑ {up_t:.1f} MB  ↓ {down_t:.1f} MB", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
@@ -325,27 +653,28 @@ def cmd_memory():
 def cmd_rules():
     data = api("/rules")
     rules = data.get("rules", [])
-    print(f"Total rules: {len(rules)}")
-    for r in rules:
-        print(f"  {r['type']:15s} {r['payload']:40s} => {r['proxy']}")
+    _out({"total": len(rules), "rules": rules})
 
 
 def cmd_providers():
     data = api("/providers/proxies")
-    for name, info in sorted(data.get("providers", {}).items()):
-        typ = info.get("type", "")
-        cnt = len(info.get("proxies", []))
-        print(f"  [{typ:10s}] {name:25s} ({cnt} proxies)")
+    providers = [{"name": name, "type": info.get("type", ""), "count": len(info.get("proxies", []))} for name, info in sorted(data.get("providers", {}).items())]
+    
+    if JSON_OUTPUT:
+        print(json.dumps(providers, indent=2))
+    else:
+        for p in providers:
+            print(f"  [{p['type']:10s}] {p['name']:25s} ({p['count']} proxies)")
 
 
 def cmd_healthcheck(provider):
     api(f"/providers/proxies/{urlencode(provider)}/healthcheck")
-    print(f"Health check triggered for '{provider}'.")
+    _out({"message": f"Health check triggered for '{provider}'"})
 
 
 def cmd_restart():
     api("/restart", "POST", {"path": "", "payload": ""})
-    print("Mihomo restarted.")
+    _out({"message": "Mihomo restarted"})
 
 
 # ─── Subscription update ──────────────────────────────────────────────────────
@@ -359,7 +688,6 @@ def _fetch_subscriptions():
         data = yaml.safe_load(f)
 
     if USE_VERGE:
-        # Verge format: items list with type=remote
         for item in data.get("items", []):
             if item.get("type") != "remote":
                 continue
@@ -369,9 +697,7 @@ def _fetch_subscriptions():
                 continue
             print(f"  Fetching: {name} ...")
             try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "clash-verge/v2.2"}
-                )
+                req = urllib.request.Request(url, headers={"User-Agent": "clash-verge/v2.2"})
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     content = resp.read()
                 filepath = os.path.join(PROFILES_DIR, item["file"])
@@ -382,7 +708,6 @@ def _fetch_subscriptions():
             except Exception as e:
                 print(f"    ❌ {name}: {e}")
     else:
-        # Own format: profiles dict
         for key, profile in data.get("profiles", {}).items():
             name = profile.get("name", key)
             url = profile.get("url", "")
@@ -390,9 +715,7 @@ def _fetch_subscriptions():
                 continue
             print(f"  Fetching: {name} ...")
             try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "mihomo-ctl/1.0"}
-                )
+                req = urllib.request.Request(url, headers={"User-Agent": "mihomo-ctl/1.0"})
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     content = resp.read()
                 filepath = os.path.join(PROFILES_DIR, profile["file"])
@@ -414,18 +737,13 @@ def cmd_sub():
     cmd_apply()
 
 
-# ─── Apply global script & generate config ────────────────────────────────────
-
-
 def cmd_apply():
     print("=== Applying config ===")
 
-    # Load profiles.yaml
     with open(PROFILES_YAML) as f:
         profiles_data = yaml.safe_load(f)
 
     if USE_VERGE:
-        # Verge format
         current_uid = profiles_data.get("current", "")
         profile_item = None
         for item in profiles_data.get("items", []):
@@ -438,7 +756,6 @@ def cmd_apply():
         profile_file = profile_item["file"]
         profile_name = profile_item.get("name", "")
     else:
-        # Own format
         current = profiles_data.get("current", "")
         profile = profiles_data.get("profiles", {}).get(current)
         if not profile:
@@ -447,11 +764,9 @@ def cmd_apply():
         profile_file = profile["file"]
         profile_name = profile.get("name", "")
 
-    # Load base config
     with open(CONFIG_YAML) as f:
         base_config = yaml.safe_load(f) or {}
 
-    # Load subscription profile
     profile_path = os.path.join(PROFILES_DIR, profile_file)
     if not os.path.exists(profile_path):
         print(f"Error: profile file not found: {profile_path}")
@@ -461,26 +776,17 @@ def cmd_apply():
     with open(profile_path) as f:
         sub_config = yaml.safe_load(f) or {}
 
-    # Merge: base config + subscription data
     final = dict(base_config)
-    for key in [
-        "proxies",
-        "proxy-groups",
-        "rules",
-        "rule-providers",
-        "proxy-providers",
-    ]:
+    for key in ["proxies", "proxy-groups", "rules", "rule-providers", "proxy-providers"]:
         if key in sub_config:
             final[key] = sub_config[key]
 
-    # Merge DNS (subscription can override/extend)
     if "dns" in sub_config:
         if "dns" in final:
             final["dns"].update(sub_config["dns"])
         else:
             final["dns"] = sub_config["dns"]
 
-    # Run global script via node.js
     if os.path.exists(GLOBAL_SCRIPT):
         with open(GLOBAL_SCRIPT) as f:
             script_content = f.read()
@@ -492,20 +798,12 @@ const config = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
 const result = main(config, '{profile_name}');
 process.stdout.write(JSON.stringify(result));
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".js", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False) as tmp:
             tmp.write(runner)
             tmp_path = tmp.name
 
         try:
-            proc = subprocess.run(
-                ["node", tmp_path],
-                input=json.dumps(final),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            proc = subprocess.run(["node", tmp_path], input=json.dumps(final), capture_output=True, text=True, timeout=10)
             if proc.returncode == 0:
                 final = json.loads(proc.stdout)
                 print("  ✅ Global script applied")
@@ -516,20 +814,15 @@ process.stdout.write(JSON.stringify(result));
     else:
         print("  (no script.js found, skipping)")
 
-    # Write generated config
     with open(GENERATED_YAML, "w") as f:
-        yaml.dump(
-            final, f, default_flow_style=False, allow_unicode=True, sort_keys=False
-        )
+        yaml.dump(final, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     n_proxies = len(final.get("proxies", []))
     n_groups = len(final.get("proxy-groups", []))
     print(f"  ✅ Generated config ({n_proxies} proxies, {n_groups} groups)")
     print(f"     {GENERATED_YAML}")
 
-    # Reload or start our own mihomo
     if not USE_VERGE and os.path.exists(SOCK_OWN):
-        # Our own mihomo is running, reload it
         try:
             reload_config()
             print("  ✅ Mihomo reloaded.")
@@ -537,117 +830,14 @@ process.stdout.write(JSON.stringify(result));
             print("  ⚠️  Failed to reload, restarting...")
             _start_mihomo()
     elif not USE_VERGE:
-        # Our own mihomo is not running, start it
         _start_mihomo()
     else:
-        # --verge mode: reload via Verge's socket
         try:
             reload_config()
             print("  ✅ Mihomo reloaded.")
         except Exception:
             print(f"  ℹ️  Mihomo not running. Start Clash Verge or run:")
             print(f"     mihomo -f {GENERATED_YAML}")
-
-
-# ─── Start / stop own mihomo ──────────────────────────────────────────────────
-
-
-def _find_mihomo_bin():
-    """Find mihomo binary: own kernel > PATH."""
-    own = os.path.join(OWN_DIR, "bin", "mihomo")
-    if os.path.exists(own) and os.access(own, os.X_OK):
-        return own
-    path_bin = shutil.which("mihomo")
-    if path_bin:
-        return path_bin
-    return None
-
-
-def _is_own_mihomo_running():
-    """Check if our own mihomo is already running."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "--", f"-ext-ctl-unix {SOCK_OWN}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return bool(result.stdout.strip())
-    except Exception:
-        return False
-
-
-def _start_mihomo():
-    """Start our own mihomo in background."""
-    if _is_own_mihomo_running():
-        print("  ℹ️  Own mihomo already running.")
-        return
-
-    binary = _find_mihomo_bin()
-    if not binary:
-        print(f"  ❌ No mihomo binary found.")
-        print(f"     Install with: mihomo-ctl kernel upgrade")
-        return
-
-    cmd = [
-        binary,
-        "-d", OWN_DIR,
-        "-f", GENERATED_YAML,
-        "-ext-ctl-unix", SOCK_OWN,
-    ]
-
-    # Start detached
-    log_path = os.path.join(OWN_DIR, "mihomo.log")
-    log_file = open(log_path, "a")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
-    )
-
-    # Wait briefly to check it started
-    time.sleep(1)
-    if proc.poll() is not None:
-        print(f"  ❌ Mihomo exited immediately (code {proc.returncode})")
-        print(f"     Check logs: {log_path}")
-        return
-
-    print(f"  ✅ Mihomo started (pid={proc.pid})")
-    print(f"     Binary: {binary}")
-    print(f"     Socket: {SOCK_OWN}")
-    print(f"     Log:    {log_path}")
-
-
-def _stop_mihomo():
-    """Stop our own mihomo processes (matched by -ext-ctl-unix SOCK_OWN)."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "--", f"-ext-ctl-unix {SOCK_OWN}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        pids = [int(p) for p in result.stdout.strip().splitlines() if p.strip()]
-    except Exception:
-        pids = []
-
-    if not pids:
-        print("  ℹ️  Own mihomo not running.")
-        return
-
-    for pid in pids:
-        try:
-            os.kill(pid, 15)  # SIGTERM
-            print(f"  ✅ Stopped mihomo (pid={pid})")
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            print(f"  ⚠️  Permission denied for pid={pid} (try sudo)")
-
-    # Clean up stale socket
-    time.sleep(0.5)
-    if os.path.exists(SOCK_OWN):
-        try:
-            os.unlink(SOCK_OWN)
-        except OSError:
-            pass
 
 
 # ─── Kernel version management ────────────────────────────────────────────────
@@ -659,16 +849,15 @@ GITHUB_DL = "https://github.com/MetaCubeX/mihomo/releases/download"
 
 
 def _detect_platform():
-    """Detect OS and arch, return (os_name, arch_suffix) for release matching."""
-    system = platform.system().lower()  # darwin, linux
-    machine = platform.machine().lower()  # arm64, x86_64, aarch64
+    system = platform.system().lower()
+    machine = platform.machine().lower()
 
     if system == "darwin":
         os_name = "darwin"
     elif system == "linux":
         os_name = "linux"
     else:
-        print(f"Error: unsupported OS '{system}'")
+        _out({"error": f"unsupported OS '{system}'"})
         sys.exit(1)
 
     if machine in ("arm64", "aarch64"):
@@ -676,53 +865,34 @@ def _detect_platform():
     elif machine in ("x86_64", "amd64"):
         arch = "amd64"
     else:
-        print(f"Error: unsupported architecture '{machine}'")
+        _out({"error": f"unsupported architecture '{machine}'"})
         sys.exit(1)
 
     return os_name, arch
 
 
 def _github_api(path):
-    """Call GitHub API and return JSON."""
     url = GITHUB_API + path
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "mihomo-ctl/1.0",
-    })
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "mihomo-ctl/1.0"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
 def _get_latest_release():
-    """Get latest stable release tag and version."""
     data = _github_api("/latest")
     return data["tag_name"]
 
 
 def _list_recent_releases(n=10):
-    """List recent release tags."""
     data = _github_api(f"?per_page={n}")
     return [r["tag_name"] for r in data if not r.get("prerelease")]
 
 
 def _build_asset_name(version, os_name, arch):
-    """Build the expected asset filename.
-
-    Naming convention: mihomo-{os}-{arch}-{version}.gz
-    For darwin-arm64: mihomo-darwin-arm64-v1.19.22.gz
-    For linux-amd64:  mihomo-linux-amd64-v1.19.22.gz  (default = GOAMD64=v3)
-    """
     return f"mihomo-{os_name}-{arch}-{version}.gz"
 
 
 def _get_current_kernel_version():
-    """Get version of the currently running/installed kernel.
-
-    Tries (in order):
-    1. Query running mihomo via API socket
-    2. Run the local binary with -v
-    """
-    # Try running instance first
     try:
         sock = _find_sock()
         if sock:
@@ -738,15 +908,10 @@ def _get_current_kernel_version():
     except Exception:
         pass
 
-    # Fallback: local binary
     if not os.path.exists(KERNEL_PATH):
         return None
     try:
-        result = subprocess.run(
-            [KERNEL_PATH, "-v"],
-            capture_output=True, text=True, timeout=5,
-        )
-        # Output like: "Mihomo Meta v1.19.22 ..." or just version
+        result = subprocess.run([KERNEL_PATH, "-v"], capture_output=True, text=True, timeout=5)
         output = result.stdout.strip()
         for word in output.split():
             if word.startswith("v") and "." in word:
@@ -757,7 +922,6 @@ def _get_current_kernel_version():
 
 
 def _download_and_install(version):
-    """Download a specific version and install to KERNEL_DIR."""
     os_name, arch = _detect_platform()
     asset = _build_asset_name(version, os_name, arch)
     url = f"{GITHUB_DL}/{version}/{asset}"
@@ -768,7 +932,6 @@ def _download_and_install(version):
     print(f"  URL:       {url}")
     print()
 
-    # Download
     print("  Downloading...", end="", flush=True)
     req = urllib.request.Request(url, headers={"User-Agent": "mihomo-ctl/1.0"})
     try:
@@ -777,26 +940,20 @@ def _download_and_install(version):
     except urllib.error.HTTPError as e:
         print(f" ❌")
         print(f"  Error: HTTP {e.code} - {e.reason}")
-        if e.code == 404:
-            print(f"  Asset not found. Check available versions with: mihomo-ctl kernel versions")
         sys.exit(1)
     print(f" ✅ ({len(compressed) / 1024 / 1024:.1f} MB)")
 
-    # Decompress
     print("  Decompressing...", end="", flush=True)
     binary = gzip.decompress(compressed)
     print(f" ✅ ({len(binary) / 1024 / 1024:.1f} MB)")
 
-    # Install
     os.makedirs(KERNEL_DIR, exist_ok=True)
     backup_path = KERNEL_PATH + ".bak"
 
-    # Backup existing
     if os.path.exists(KERNEL_PATH):
         shutil.copy2(KERNEL_PATH, backup_path)
         print(f"  Backed up existing kernel to {backup_path}")
 
-    # Write new binary
     with tempfile.NamedTemporaryFile(dir=KERNEL_DIR, delete=False) as tmp:
         tmp.write(binary)
         tmp_path = tmp.name
@@ -805,71 +962,72 @@ def _download_and_install(version):
     shutil.move(tmp_path, KERNEL_PATH)
     print(f"  ✅ Installed to {KERNEL_PATH}")
 
-    # Verify
     new_ver = _get_current_kernel_version()
     if new_ver:
         print(f"  ✅ Verified: {new_ver}")
 
 
 def cmd_kernel(action=None, *kernel_args):
-    """Kernel version management."""
     if action is None or action == "status":
         ver = _get_current_kernel_version()
-        if ver:
-            print(f"  Installed: {ver}")
-            print(f"  Path:      {KERNEL_PATH}")
-        else:
-            print(f"  No kernel found at {KERNEL_PATH}")
+        result = {"installed": ver, "path": KERNEL_PATH if ver else None}
         try:
             latest = _get_latest_release()
-            print(f"  Latest:    {latest}")
-            if ver and ver != latest:
-                print(f"  ⬆️  Upgrade available! Run: mihomo-ctl kernel upgrade")
+            result["latest"] = latest
+            result["upgrade_available"] = ver != latest if ver else True
         except Exception as e:
-            print(f"  (could not check latest: {e})")
+            result["error"] = str(e)
+        
+        if JSON_OUTPUT:
+            print(json.dumps(result, indent=2))
+        else:
+            if ver:
+                print(f"  Installed: {ver}")
+                print(f"  Path:      {KERNEL_PATH}")
+            else:
+                print(f"  No kernel found at {KERNEL_PATH}")
+            try:
+                latest = _get_latest_release()
+                print(f"  Latest:    {latest}")
+                if ver and ver != latest:
+                    print(f"  ⬆️  Upgrade available! Run: mihomo-ctl kernel upgrade")
+                elif ver:
+                    print(f"  ✅ Up to date")
+            except Exception as e:
+                print(f"  (could not check latest: {e})")
 
     elif action == "versions":
-        flags = set(kernel_args)
-        if "--upgrade" in flags or "-u" in flags:
-            # Show versions and upgrade to latest
-            cur = _get_current_kernel_version()
+        cur = _get_current_kernel_version()
+        try:
             latest = _get_latest_release()
-            print(f"  Current:  {cur or 'not installed'}")
-            print(f"  Latest:   {latest}")
-            if cur == latest:
-                print("  ✅ Already up to date.")
-                return
-            print()
-            _download_and_install(latest)
-        else:
-            # List recent versions
-            cur = _get_current_kernel_version()
-            print(f"  Current:  {cur or 'not installed'}")
-            print()
-            print("=== Recent Releases ===")
             releases = _list_recent_releases()
-            for tag in releases:
-                marker = " ◀ installed" if tag == cur else ""
-                print(f"  {tag}{marker}")
-            print()
-            print("  Upgrade to latest: mihomo-ctl kernel versions --upgrade")
-            print("  Install specific:  mihomo-ctl kernel install <version>")
+            
+            if JSON_OUTPUT:
+                print(json.dumps({"current": cur, "latest": latest, "releases": releases}, indent=2))
+            else:
+                print(f"  Current:  {cur or 'not installed'}")
+                print(f"  Latest:   {latest}")
+                print()
+                print("Recent Releases:")
+                for tag in releases:
+                    marker = " ◀ installed" if tag == cur else (" ⭐ latest" if tag == latest else "")
+                    print(f"  {tag}{marker}")
+        except Exception as e:
+            _out({"error": str(e)})
 
     elif action == "upgrade":
         cur = _get_current_kernel_version()
         latest = _get_latest_release()
-        print(f"  Current:  {cur or 'not installed'}")
-        print(f"  Latest:   {latest}")
+        
         if cur == latest:
-            print("  ✅ Already up to date.")
+            _out({"message": "Already up to date", "version": latest})
             return
-        print()
+        
         _download_and_install(latest)
 
     elif action == "install":
         if not kernel_args:
-            print("Usage: mihomo-ctl kernel install <version>")
-            print("  e.g. mihomo-ctl kernel install v1.19.22")
+            _out({"error": "Usage: mihomo-ctl kernel install <version>"})
             sys.exit(1)
         version = kernel_args[0]
         if not version.startswith("v"):
@@ -880,29 +1038,7 @@ def cmd_kernel(action=None, *kernel_args):
         print(KERNEL_PATH)
 
     else:
-        print("Usage: mihomo-ctl kernel <command>")
-        print("  status               Show installed & latest version")
-        print("  versions             List recent releases")
-        print("  versions --upgrade   List versions & upgrade to latest")
-        print("  upgrade              Upgrade to latest release")
-        print("  install <version>    Install a specific version")
-        print("  path                 Print kernel binary path")
-        sys.exit(1)
-
-
-# ─── Script view/edit ─────────────────────────────────────────────────────────
-
-
-def cmd_script(action=None):
-    if action == "edit":
-        editor = os.environ.get("EDITOR", "vim")
-        os.execvp(editor, [editor, GLOBAL_SCRIPT])
-    else:
-        if os.path.exists(GLOBAL_SCRIPT):
-            with open(GLOBAL_SCRIPT) as f:
-                print(f.read())
-        else:
-            print(f"No script found at {GLOBAL_SCRIPT}")
+        _out({"error": "Unknown kernel command. Use: status, versions, upgrade, install <version>, path"})
 
 
 # ─── Profile management ──────────────────────────────────────────────────────
@@ -914,195 +1050,190 @@ def cmd_profile(action=None, *profile_args):
 
     if action is None or action == "list":
         current = data.get("current", "")
-        print("=== Profiles ===")
-        for key, p in data.get("profiles", {}).items():
-            marker = " ◀" if key == current else ""
-            updated = p.get("updated", "never")
-            if isinstance(updated, int):
-                updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
-            print(f"  {key:15s} {p.get('name',''):15s} updated: {updated}{marker}")
+        
+        if USE_VERGE:
+            items = data.get("items", [])
+            result = [{"uid": item.get("uid"), "name": item.get("name"), "type": item.get("type"), "selected": item.get("uid") == current} for item in items]
+        else:
+            result = [{"key": key, **p, "selected": key == current} for key, p in data.get("profiles", {}).items()]
+        
+        if JSON_OUTPUT:
+            print(json.dumps(result, indent=2))
+        else:
+            print("=== Profiles ===")
+            if USE_VERGE:
+                for item in items:
+                    marker = " ◀" if item.get("uid") == current else ""
+                    print(f"  {item.get('name', item.get('uid', '?'))} [{item.get('type')}] {marker}")
+            else:
+                for key, p in data.get("profiles", {}).items():
+                    marker = " ◀" if key == current else ""
+                    updated = p.get("updated", "never")
+                    if isinstance(updated, int):
+                        updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
+                    print(f"  {key:15s} {p.get('name',''):15s} updated: {updated}{marker}")
+    
     elif action == "use":
         if not profile_args:
-            print("Usage: mihomo-ctl profile use <name>")
+            _out({"error": "Usage: mihomo-ctl profile use <name>"})
             sys.exit(1)
         name = profile_args[0]
-        if name not in data.get("profiles", {}):
-            print(f"Error: profile '{name}' not found")
-            sys.exit(1)
-        data["current"] = name
+        
+        if USE_VERGE:
+            uid_exists = any(item.get("uid") == name for item in data.get("items", []))
+            if not uid_exists:
+                _out({"error": f"Profile '{name}' not found"})
+                sys.exit(1)
+            data["current"] = name
+        else:
+            if name not in data.get("profiles", {}):
+                _out({"error": f"Profile '{name}' not found"})
+                sys.exit(1)
+            data["current"] = name
+        
         with open(PROFILES_YAML, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
-        print(f"Switched to profile: {name}")
+        
+        _out({"message": f"Switched to profile: {name}"})
         cmd_apply()
+    
     elif action == "add":
         if len(profile_args) < 2:
-            print("Usage: mihomo-ctl profile add <name> <url>")
+            _out({"error": "Usage: mihomo-ctl profile add <name> <url>"})
             sys.exit(1)
         name, url = profile_args[0], profile_args[1]
         if "profiles" not in data:
             data["profiles"] = {}
-        data["profiles"][name] = {
-            "name": name,
-            "url": url,
-            "file": f"{name}.yaml",
-        }
+        data["profiles"][name] = {"name": name, "url": url, "file": f"{name}.yaml"}
         with open(PROFILES_YAML, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
-        print(f"Added profile: {name}")
-    else:
-        print("Usage: mihomo-ctl profile [list|use <name>|add <name> <url>]")
+        _out({"message": f"Added profile: {name}"})
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 HELP = """\
-mihomo-ctl - standalone CLI controller for mihomo
+mihomo-ctl - CLI controller for mihomo (agent-optimized)
 
 FLAGS:
-  --verge              Use Clash Verge's config directory instead of own
+  --verge    Use Clash Verge's config directory
+  --json     JSON output for machine parsing
+  --hints    Show action hints in output
 
-CONFIG DIR: ~/.local/share/mihomo/  (or Clash Verge dir with --verge)
-  config.yaml     Base config (ports, dns, tun)
-  profiles.yaml   Subscription list
-  profiles/       Downloaded subscription files
-  script.js       Global enhancement script (node.js)
-  generated.yaml  Final config for mihomo
+COMMANDS (combined, agent-optimized):
+  overview             Everything in one call: status + groups + suggestions
+  gdelay <group>       Test latency + show fastest + hints
+  switch <grp> <px>    Switch + verify + hints
+  sub                  Update + apply + new group summary
+  status               Status with groups overview
 
-USAGE:
-  mihomo-ctl <command> [arguments]
-
-COMMANDS:
-  Status & Info:
-    status, s              Show mihomo status
-    traffic, t             Stream real-time traffic
-    memory, mem            Stream memory usage
-    logs [level]           Stream logs (info/warning/error/debug)
-
-  Proxy Control:
-    groups, g              List all proxy groups
-    list, l <group>        List proxies in a group (◀ = current)
-    switch, sw <grp> <px>  Switch selector group
-    delay, d <proxy>       Test proxy delay
-    gdelay, gd <group>     Test group delay
-
-  Mode:
-    mode, m                Show current mode
-    mode, m <mode>         Switch mode (rule|global|direct)
-
-  Connections:
-    conns, c               List active connections
-    killall, ka            Close all connections
-
-  DNS:
-    dns <domain> [type]    Query DNS
-    flush-dns              Flush DNS cache
-    flush-fakeip           Flush FakeIP cache
-
-  Config & Subscription:
-    sub, update            Fetch subscriptions + apply + reload
-    apply, a               Run script + generate config + reload
-    reload, r              Force reload current config
-    patch, p '<json>'      Hot-patch running config
-    script, sc             View global script
-    script edit            Edit script in $EDITOR
-    profile                List profiles
-    profile use <name>     Switch active profile
-    profile add <n> <url>  Add a new subscription
-
-  Providers:
-    providers              List proxy providers
-    healthcheck, hc <name> Trigger provider health check
-
-  Rules:
-    rules                  List all rules
-
-  Process:
-    start                  Start own mihomo instance
-    stop                   Stop own mihomo instance
-
-  Kernel:
-    kernel, k              Show installed & latest kernel version
-    kernel versions        List recent releases
-    kernel versions -u     List + upgrade to latest
-    kernel upgrade         Upgrade kernel to latest release
-    kernel install <ver>   Install a specific version
-    kernel path            Print kernel binary path
-
-  System:
-    restart                Restart mihomo kernel
+BASIC COMMANDS:
+  groups, g            List all proxy groups
+  list, l <group>      List proxies in a group (◀ = current)
+  delay, d <proxy>     Test single proxy latency
+  mode, m [mode]       Show/set mode (rule|global|direct)
+  conns, c             List active connections
+  killall, ka          Close all connections
+  dns <domain> [type]  Query DNS
+  flush-dns            Flush DNS cache
+  reload, r            Reload config
+  profile              List/manage profiles
+  kernel, k            Kernel version management
+  start/stop           Control mihomo process
 
 EXAMPLES:
-  mihomo-ctl sub                        # fetch subs + apply + reload
-  mihomo-ctl --verge sub                # same but using Verge's config
-  mihomo-ctl apply                      # re-run script + reload
-  mihomo-ctl groups
-  mihomo-ctl switch 'AI Suite' 'AI Auto'
-  mihomo-ctl gdelay Fast
-  mihomo-ctl profile add xyz 'https://...'
-  mihomo-ctl profile use xyz
-  mihomo-ctl script edit
-  mihomo-ctl kernel versions              # list recent releases
-  mihomo-ctl kernel versions --upgrade    # list + upgrade to latest
-  mihomo-ctl kernel upgrade               # upgrade to latest
-  mihomo-ctl kernel install v1.19.22      # install specific version
+  mihomo-ctl overview                # Get all info at once
+  mihomo-ctl gdelay Fast            # Test Fast group + show fastest
+  mihomo-ctl gdelay --auto          # Auto-switch to fastest
+  mihomo-ctl switch Fast 香港-01    # Switch with verification
+  mihomo-ctl sub --json | jq .      # Parse subscription data
 """
 
 
 def main():
     args = sys.argv[1:]
-    cmd = args[0] if args else "help"
+    
+    # Check for global flags
+    global HINTS, JSON_OUTPUT
+    
+    # Parse while preserving flags for commands that need them
+    clean_args = []
+    for i, arg in enumerate(args):
+        if arg in ["--json", "--hints", "--no-hints"]:
+            if arg == "--json":
+                JSON_OUTPUT = True
+            elif arg == "--hints":
+                HINTS = True
+            elif arg == "--no-hints":
+                HINTS = False
+        else:
+            clean_args.append(arg)
+    
+    cmd = clean_args[0] if clean_args else "help"
 
     match cmd:
+        case "overview":
+            cmd_overview()
+        case "gdelay" | "gd":
+            group = clean_args[1] if len(clean_args) > 1 else None
+            auto = "--auto" in clean_args
+            if auto:
+                clean_args = [c for c in clean_args if c != "--auto"]
+                group = clean_args[1] if len(clean_args) > 1 else None
+            cmd_gdelay_with_switch(group, auto)
+        case "switch" | "sw":
+            if len(clean_args) < 3:
+                _out({"error": "Usage: mihomo-ctl switch <group> <proxy>"})
+                sys.exit(1)
+            cmd_switch_with_verification(clean_args[1], clean_args[2])
+        case "sub" | "update":
+            cmd_sub_with_summary()
         case "status" | "s":
-            cmd_status()
+            cmd_status_with_groups()
         case "mode" | "m":
-            cmd_mode(args[1] if len(args) > 1 else None)
+            new_mode = clean_args[1] if len(clean_args) > 1 else None
+            if new_mode:
+                api("/configs", "PATCH", {"mode": new_mode})
+                _out({"message": f"Mode switched to: {new_mode}"})
+            else:
+                cfg = api("/configs")
+                _out({"mode": cfg.get("mode")})
         case "groups" | "g":
             cmd_groups()
         case "list" | "l":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl list <group-name>")
+            if len(clean_args) < 2:
+                _out({"error": "Usage: mihomo-ctl list <group-name>"})
                 sys.exit(1)
-            cmd_list(args[1])
-        case "switch" | "sw":
-            if len(args) < 3:
-                print("Usage: mihomo-ctl switch <group> <proxy>")
-                sys.exit(1)
-            cmd_switch(args[1], args[2])
+            cmd_list(clean_args[1])
         case "delay" | "d":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl delay <proxy> [url] [timeout]")
+            if len(clean_args) < 2:
+                _out({"error": "Usage: mihomo-ctl delay <proxy> [url] [timeout]"})
                 sys.exit(1)
-            cmd_delay(args[1], *args[2:])
-        case "gdelay" | "gd":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl gdelay <group> [url] [timeout]")
-                sys.exit(1)
-            cmd_gdelay(args[1], *args[2:])
+            cmd_delay(clean_args[1], *clean_args[2:])
         case "conns" | "c":
             cmd_conns()
         case "killall" | "ka":
             cmd_killall()
         case "dns":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl dns <domain> [type]")
+            if len(clean_args) < 2:
+                _out({"error": "Usage: mihomo-ctl dns <domain> [type]"})
                 sys.exit(1)
-            cmd_dns(args[1], args[2] if len(args) > 2 else "A")
+            cmd_dns(clean_args[1], clean_args[2] if len(clean_args) > 2 else "A")
         case "flush-dns":
             cmd_flush_dns()
         case "flush-fakeip":
             cmd_flush_fakeip()
         case "reload" | "r":
-            cmd_reload(args[1] if len(args) > 1 else None)
+            cmd_reload(clean_args[1] if len(clean_args) > 1 else None)
         case "patch" | "p":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl patch '<json>'")
+            if len(clean_args) < 2:
+                _out({"error": "Usage: mihomo-ctl patch '<json>'"})
                 sys.exit(1)
-            cmd_patch(args[1])
+            cmd_patch(clean_args[1])
         case "traffic" | "t":
             cmd_traffic()
         case "logs":
-            cmd_logs(args[1] if len(args) > 1 else "info")
+            cmd_logs(clean_args[1] if len(clean_args) > 1 else "info")
         case "memory" | "mem":
             cmd_memory()
         case "rules":
@@ -1110,32 +1241,109 @@ def main():
         case "providers":
             cmd_providers()
         case "healthcheck" | "hc":
-            if len(args) < 2:
-                print("Usage: mihomo-ctl healthcheck <provider>")
+            if len(clean_args) < 2:
+                _out({"error": "Usage: mihomo-ctl healthcheck <provider>"})
                 sys.exit(1)
-            cmd_healthcheck(args[1])
+            cmd_healthcheck(clean_args[1])
         case "start":
             _start_mihomo()
         case "stop":
             _stop_mihomo()
         case "restart":
             cmd_restart()
-        case "sub" | "update":
-            cmd_sub()
         case "apply" | "a":
             cmd_apply()
-        case "script" | "sc":
-            cmd_script(args[1] if len(args) > 1 else None)
         case "profile" | "prof":
-            cmd_profile(*args[1:])
+            cmd_profile(*clean_args[1:])
         case "kernel" | "k":
-            cmd_kernel(*args[1:])
+            cmd_kernel(*clean_args[1:])
         case "help" | "h" | "--help" | "-h":
             print(HELP)
         case _:
             print(f"Unknown command: {cmd}")
             print("Run 'mihomo-ctl help' for usage.")
             sys.exit(1)
+
+
+# ─── Process control (keep for compatibility) ──────────────────────────────────
+
+SOCK_OWN = "/tmp/mihomo-ctl.sock"
+OWN_DIR = os.path.expanduser("~/.local/share/mihomo")
+
+
+def _find_mihomo_bin():
+    own = os.path.join(OWN_DIR, "bin", "mihomo")
+    if os.path.exists(own) and os.access(own, os.X_OK):
+        return own
+    path_bin = shutil.which("mihomo")
+    if path_bin:
+        return path_bin
+    return None
+
+
+def _is_own_mihomo_running():
+    try:
+        result = subprocess.run(["pgrep", "-f", "--", f"-ext-ctl-unix {SOCK_OWN}"], capture_output=True, text=True, timeout=5)
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _start_mihomo():
+    if _is_own_mihomo_running():
+        print("  ℹ️  Own mihomo already running.")
+        return
+
+    binary = _find_mihomo_bin()
+    if not binary:
+        print("  ❌ No mihomo binary found.")
+        print("     Install with: mihomo-ctl kernel upgrade")
+        return
+
+    GENERATED_YAML = os.path.join(OWN_DIR, "generated.yaml")
+    cmd = [binary, "-d", OWN_DIR, "-f", GENERATED_YAML, "-ext-ctl-unix", SOCK_OWN]
+
+    log_path = os.path.join(OWN_DIR, "mihomo.log")
+    log_file = open(log_path, "a")
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file, start_new_session=True)
+
+    time.sleep(1)
+    if proc.poll() is not None:
+        print(f"  ❌ Mihomo exited immediately (code {proc.returncode})")
+        print(f"     Check logs: {log_path}")
+        return
+
+    print(f"  ✅ Mihomo started (pid={proc.pid})")
+    print(f"     Binary: {binary}")
+    print(f"     Socket: {SOCK_OWN}")
+
+
+def _stop_mihomo():
+    try:
+        result = subprocess.run(["pgrep", "-f", "--", f"-ext-ctl-unix {SOCK_OWN}"], capture_output=True, text=True, timeout=5)
+        pids = [int(p) for p in result.stdout.strip().splitlines() if p.strip()]
+    except Exception:
+        pids = []
+
+    if not pids:
+        print("  ℹ️  Own mihomo not running.")
+        return
+
+    for pid in pids:
+        try:
+            os.kill(pid, 15)
+            print(f"  ✅ Stopped mihomo (pid={pid})")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            print(f"  ⚠️  Permission denied for pid={pid}")
+
+    time.sleep(0.5)
+    if os.path.exists(SOCK_OWN):
+        try:
+            os.unlink(SOCK_OWN)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
